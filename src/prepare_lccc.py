@@ -1,11 +1,17 @@
-"""LCCC-base 中文对话数据预处理脚本。"""
+"""LCCC-base 中文对话数据预处理脚本。
+
+支持 Hugging Face 流式读取和本地 JSON/JSONL，避免一次性把数百万条
+对话加载进内存；使用 re 完成文本清洗，pandas 负责最终统计表整理。
+"""
 
 import argparse
 import json
 import random
 import re
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, Iterator, List, Optional
+
+import pandas as pd
 
 try:
     from datasets import load_dataset
@@ -32,8 +38,11 @@ def clean_text(text: Any) -> str:
 def load_sensitive_words(path: Path) -> List[str]:
     if not path.exists():
         return []
-    return [x.strip() for x in path.read_text(encoding="utf-8").splitlines()
-            if x.strip() and not x.strip().startswith("#")]
+    return [
+        x.strip()
+        for x in path.read_text(encoding="utf-8").splitlines()
+        if x.strip() and not x.strip().startswith("#")
+    ]
 
 
 def contains_sensitive(text: str, sensitive_words: Iterable[str]) -> bool:
@@ -76,50 +85,53 @@ def record_to_messages(record: Any, sensitive_words: List[str]) -> Optional[Dict
         return None
     if contains_sensitive("\n".join(utterances), sensitive_words):
         return None
+    return {
+        "messages": [
+            {"role": "user" if i % 2 == 0 else "assistant", "content": text}
+            for i, text in enumerate(utterances)
+        ]
+    }
 
-    messages = [
-        {"role": "user" if i % 2 == 0 else "assistant", "content": text}
-        for i, text in enumerate(utterances)
-    ]
-    return {"messages": messages}
 
-
-def load_records(args: argparse.Namespace) -> List[Any]:
-    if args.input_file:
-        path = Path(args.input_file)
+def iter_local_records(path: Path) -> Iterator[Any]:
+    """支持 JSON 数组和 JSONL，JSONL 优先采用逐行读取。"""
+    if path.suffix.lower() == ".jsonl":
         with path.open("r", encoding="utf-8") as f:
-            data = json.load(f)
-        if isinstance(data, dict):
-            for key in ("data", "train", "conversations", "dialogues"):
-                if isinstance(data.get(key), list):
-                    data = data[key]
-                    break
-        if not isinstance(data, list):
-            raise ValueError("本地 JSON 文件必须最终解析为 list。")
-        return data
+            for line in f:
+                line = line.strip()
+                if line:
+                    yield json.loads(line)
+        return
 
+    with path.open("r", encoding="utf-8") as f:
+        data = json.load(f)
+    if isinstance(data, dict):
+        for key in ("data", "train", "conversations", "dialogues"):
+            if isinstance(data.get(key), list):
+                data = data[key]
+                break
+    if not isinstance(data, list):
+        raise ValueError("本地 JSON 文件必须最终解析为 list。")
+    yield from data
+
+
+def iter_hf_records(args: argparse.Namespace) -> Iterator[Any]:
     if load_dataset is None:
         raise RuntimeError("未安装 datasets，请执行 pip install -r requirements.txt")
-
-    # silver/lccc 是 Hugging Face 上可直接读取的 LCCC 镜像，字段为 dialog。
-    dataset = load_dataset(args.dataset_name, "base", split=args.split)
-    return [dataset[i] for i in range(len(dataset))]
+    dataset = load_dataset(
+        args.dataset_name,
+        "base",
+        split=args.split,
+        streaming=True,
+    )
+    for record in dataset:
+        yield record
 
 
 def write_jsonl(path: Path, records: List[Dict[str, Any]]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as f:
+    with path.open("a", encoding="utf-8") as f:
         for record in records:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
-
-
-def split_data(records: List[Dict[str, Any]], train_ratio: float, valid_ratio: float, seed: int):
-    records = list(records)
-    random.Random(seed).shuffle(records)
-    n = len(records)
-    train_end = int(n * train_ratio)
-    valid_end = train_end + int(n * valid_ratio)
-    return records[:train_end], records[train_end:valid_end], records[valid_end:]
 
 
 def main() -> None:
@@ -139,46 +151,80 @@ def main() -> None:
         raise ValueError("train_ratio + valid_ratio 必须小于 1")
 
     output_dir = Path(args.output_dir)
-    sensitive_words = load_sensitive_words(Path(args.sensitive_words))
-    raw_records = load_records(args)
-    if args.max_samples > 0:
-        raw_records = raw_records[:args.max_samples]
+    output_dir.mkdir(parents=True, exist_ok=True)
+    train_path = output_dir / "train.jsonl"
+    valid_path = output_dir / "valid.jsonl"
+    test_path = output_dir / "test.jsonl"
+    for path in (train_path, valid_path, test_path):
+        path.write_text("", encoding="utf-8")
 
-    cleaned: List[Dict[str, Any]] = []
+    sensitive_words = load_sensitive_words(Path(args.sensitive_words))
+    records = iter_local_records(Path(args.input_file)) if args.input_file else iter_hf_records(args)
+    rng = random.Random(args.seed)
+
     stats = {
-        "raw_records": len(raw_records),
+        "raw_records": 0,
         "kept_records": 0,
         "removed_empty_or_short": 0,
         "removed_sensitive": 0,
         "removed_invalid": 0,
         "sensitive_word_count": len(sensitive_words),
+        "train_records": 0,
+        "valid_records": 0,
+        "test_records": 0,
     }
 
-    for record in raw_records:
+    for record in records:
+        if args.max_samples > 0 and stats["raw_records"] >= args.max_samples:
+            break
+        stats["raw_records"] += 1
+
         utterances = [clean_text(x) for x in extract_utterances(record)]
         utterances = [x for x in utterances if x]
         if len(utterances) < 2:
             stats["removed_empty_or_short"] += 1
             continue
+
         if contains_sensitive("\n".join(utterances), sensitive_words):
             stats["removed_sensitive"] += 1
             continue
+
         converted = record_to_messages(utterances, sensitive_words)
         if converted is None:
             stats["removed_invalid"] += 1
             continue
-        cleaned.append(converted)
 
-    stats["kept_records"] = len(cleaned)
+        # 用固定随机种子在线分配，避免把全部样本放入内存。
+        r = rng.random()
+        if r < args.train_ratio:
+            write_jsonl(train_path, [converted])
+            stats["train_records"] += 1
+        elif r < args.train_ratio + args.valid_ratio:
+            write_jsonl(valid_path, [converted])
+            stats["valid_records"] += 1
+        else:
+            write_jsonl(test_path, [converted])
+            stats["test_records"] += 1
+        stats["kept_records"] += 1
+
     stats["removed_total"] = stats["raw_records"] - stats["kept_records"]
     stats["retention_rate"] = round(stats["kept_records"] / max(stats["raw_records"], 1), 6)
 
-    train, valid, test = split_data(cleaned, args.train_ratio, args.valid_ratio, args.seed)
-    write_jsonl(output_dir / "train.jsonl", train)
-    write_jsonl(output_dir / "valid.jsonl", valid)
-    write_jsonl(output_dir / "test.jsonl", test)
+    # 使用 pandas 整理统计结果，便于报告和后续扩展。
+    summary_df = pd.DataFrame([stats])
+    stats = summary_df.iloc[0].to_dict()
+    stats["raw_records"] = int(stats["raw_records"])
+    stats["kept_records"] = int(stats["kept_records"])
+    stats["removed_empty_or_short"] = int(stats["removed_empty_or_short"])
+    stats["removed_sensitive"] = int(stats["removed_sensitive"])
+    stats["removed_invalid"] = int(stats["removed_invalid"])
+    stats["sensitive_word_count"] = int(stats["sensitive_word_count"])
+    stats["train_records"] = int(stats["train_records"])
+    stats["valid_records"] = int(stats["valid_records"])
+    stats["test_records"] = int(stats["test_records"])
+    stats["removed_total"] = int(stats["removed_total"])
+    stats["retention_rate"] = float(stats["retention_rate"])
 
-    stats.update({"train_records": len(train), "valid_records": len(valid), "test_records": len(test)})
     (output_dir / "statistics.json").write_text(
         json.dumps(stats, ensure_ascii=False, indent=2), encoding="utf-8"
     )
