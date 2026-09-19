@@ -1,0 +1,10 @@
+name: lccc-preprocess
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - pip
+  - pip:
+      - datasets>=2.18,<4.0
+      - pandas>=2.0,<3.0
