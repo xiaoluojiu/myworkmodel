@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+.venv/
+.env
+.DS_Store
+
+# 原始数据与大规模处理结果
+/data/raw/
+/data/processed/*.jsonl
+/data/processed/statistics.json
